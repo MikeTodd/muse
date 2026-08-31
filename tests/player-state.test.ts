@@ -115,6 +115,7 @@ const getPrivateState = (player: Player) => player as unknown as {
   finishQueue(): Promise<void>;
   nowPlaying: QueuedSong | null;
   nowPlayingQueueEntryVersion: number | null;
+  onAudioPlayerIdle(oldState: object, newState: object): Promise<void>;
   playAudioPlayerResource(resource: object): void;
   startTrackingPosition(position?: number): void;
 };
@@ -553,6 +554,76 @@ describe('Player queue-finish timer state', () => {
   });
 });
 
+describe('Player playing-message updates', () => {
+  it('tracks the current public response and retires it after a terminal update', async () => {
+    const player = new Player({} as never, GUILD_ID);
+    const updatePlayingMessage = vi.fn().mockResolvedValue(undefined);
+    player.setPlayingMessageUpdater(updatePlayingMessage, 'playing-message-id');
+
+    expect(player.isPlayingMessage('playing-message-id')).toBe(true);
+    player.stop();
+    await vi.runAllTimersAsync();
+
+    expect(updatePlayingMessage).toHaveBeenCalledWith('stopped');
+    expect(player.isPlayingMessage('playing-message-id')).toBe(false);
+  });
+
+  it('refreshes the playing message every five seconds of playback', async () => {
+    const {player} = makeReadyPlayer();
+    player.add(makeSong('Timed song'));
+    await player.play();
+    const updatePlayingMessage = vi.fn().mockResolvedValue(undefined);
+    player.setPlayingMessageUpdater(updatePlayingMessage);
+
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(updatePlayingMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updatePlayingMessage).toHaveBeenCalledOnce();
+    expect(player.getPosition()).toBe(5);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(updatePlayingMessage).toHaveBeenCalledTimes(2);
+    expect(player.getPosition()).toBe(10);
+  });
+
+  it('uses the configured playing-message refresh interval', async () => {
+    const player = new Player({} as never, GUILD_ID, undefined, 2);
+    const voiceConnection = makeVoiceConnection();
+    player.voiceConnection = voiceConnection as never;
+    Object.assign(player, {getStream: vi.fn().mockResolvedValue(Readable.from([]))});
+    player.add(makeSong('Configurable cadence'));
+    await player.play();
+    const updatePlayingMessage = vi.fn().mockResolvedValue(undefined);
+    player.setPlayingMessageUpdater(updatePlayingMessage);
+
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(updatePlayingMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updatePlayingMessage).toHaveBeenCalledOnce();
+  });
+
+  it('refreshes the playing message after shuffle and natural song completion', async () => {
+    const {player} = makeReadyPlayer();
+    const current = makeSong('Current');
+    const upcoming = makeSong('Upcoming');
+    player.add(current);
+    player.add(upcoming);
+    await player.play();
+    const updatePlayingMessage = vi.fn().mockResolvedValue(undefined);
+    player.setPlayingMessageUpdater(updatePlayingMessage);
+
+    player.shuffle();
+    expect(updatePlayingMessage).toHaveBeenCalledOnce();
+
+    await getPrivateState(player).onAudioPlayerIdle({}, {status: 'idle'});
+    expect(player.getCurrent()).toBe(upcoming);
+    expect(player.getQueue()).toEqual([]);
+    expect(updatePlayingMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('Player voice ducking', () => {
   it('stores a manual session volume once across overlapping speakers and restores it after the last speaker', () => {
     const player = new Player({} as never, GUILD_ID);
@@ -758,17 +829,31 @@ describe('Player age-restricted fallback preservation', () => {
   });
 });
 
-describe('progress marker bounds', () => {
+describe('graphical progress bar', () => {
   it.each([
     [0, true, false],
     [1, false, true],
-  ])('shows exactly one visible marker at progress %s', (progress, startsWithMarker, endsWithMarker) => {
-    const progressBar = getProgressBar(10, progress);
+  ])('shows exactly one blue slider knob at progress %s', (progress, startsWithKnob, endsWithKnob) => {
+    const progressBar = getProgressBar(91, progress);
     const characters = [...progressBar];
 
-    expect(characters).toHaveLength(10);
     expect(characters.filter(character => character === '🔘')).toHaveLength(1);
-    expect(progressBar.startsWith('🔘')).toBe(startsWithMarker);
-    expect(progressBar.endsWith('🔘')).toBe(endsWithMarker);
+    expect(progressBar.startsWith('🔘')).toBe(startsWithKnob);
+    expect(progressBar.endsWith('🔘')).toBe(endsWithKnob);
+    expect(characters.filter(character => character === '\u200A')).toHaveLength(90);
+  });
+
+  it('uses a continuous Markdown rail around the knob', () => {
+    const railUnit = '\u200A';
+    const joiner = '\u2060';
+
+    expect(getProgressBar(5, 0.4)).toBe(`~~${joiner}${railUnit.repeat(2)}${joiner}~~🔘~~${joiner}${railUnit.repeat(2)}${joiner}~~`);
+  });
+
+  it('advances on every five-second refresh for a typical song', () => {
+    const duration = 7.5 * 60;
+    for (let position = 0; position < duration; position += 5) {
+      expect(getProgressBar(91, (position + 5) / duration)).not.toBe(getProgressBar(91, position / duration));
+    }
   });
 });

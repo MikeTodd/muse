@@ -3,15 +3,15 @@ import {inject, injectable} from 'inversify';
 import shuffle from 'array-shuffle';
 import {TYPES} from '../types.js';
 import GetSongs from '../services/get-songs.js';
-import {MediaSource, SongMetadata, STATUS} from './player.js';
+import {MediaSource, type PlayingMessageTerminalState, SongMetadata, STATUS} from './player.js';
 import PlayerManager from '../managers/player.js';
-import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
+import {buildQueueEmbed} from '../utils/build-embed.js';
 import {getMemberVoiceChannel, getMostPopularVoiceChannel} from '../utils/channels.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {SponsorBlock} from 'sponsorblock-api';
 import Config from './config.js';
 import KeyValueCacheProvider from './key-value-cache.js';
-import {ONE_HOUR_IN_SECONDS} from '../utils/constants.js';
+import {MUSIC_CONTROL_EMOJIS, ONE_HOUR_IN_SECONDS} from '../utils/constants.js';
 
 const isSameQueueEntry = (capturedId: number | null, currentId: number | null) => (
   capturedId !== null && capturedId === currentId
@@ -65,7 +65,7 @@ export default class AddQueryToQueue {
 
     const settings = await getGuildSettings(guildId);
 
-    const {playlistLimit, queueAddResponseEphemeral} = settings;
+    const {playlistLimit, queueAddResponseEphemeral, defaultQueuePageSize = 10} = settings;
 
     await interaction.deferReply({ephemeral: queueAddResponseEphemeral});
 
@@ -113,16 +113,11 @@ export default class AddQueryToQueue {
     } else if (player.status === STATUS.IDLE) {
       // Player is idle, start playback instead
       await player.play();
+      shouldShowPlayingEmbed = true;
     }
 
     if (!player.getCurrent()) {
       throw new Error('no playable songs found');
-    }
-
-    if (shouldShowPlayingEmbed) {
-      await interaction.editReply({
-        embeds: [buildPlayingMessageEmbed(player)],
-      });
     }
 
     let didSkipCurrentTrack = false;
@@ -148,10 +143,54 @@ export default class AddQueryToQueue {
       extraMsg = ` (${extraMsg})`;
     }
 
-    if (newSongs.length === 1) {
-      await interaction.editReply(`u betcha, **${firstSong.title}** added to the${addToFrontOfQueue ? ' front of the' : ''} queue${didSkipCurrentTrack ? ' and current track skipped' : ''}${extraMsg}`);
-    } else {
-      await interaction.editReply(`u betcha, **${firstSong.title}** and ${newSongs.length - 1} other songs were added to the queue${didSkipCurrentTrack ? ' and current track skipped' : ''}${extraMsg}`);
+    const responseContent = newSongs.length === 1
+      ? `u betcha, **${firstSong.title}** added to the${addToFrontOfQueue ? ' front of the' : ''} queue${didSkipCurrentTrack ? ' and current track skipped' : ''}${extraMsg}`
+      : `u betcha, **${firstSong.title}** and ${newSongs.length - 1} other songs were added to the queue${didSkipCurrentTrack ? ' and current track skipped' : ''}${extraMsg}`;
+
+    if (!shouldShowPlayingEmbed) {
+      await interaction.editReply(responseContent);
+      return;
+    }
+
+    // The queue embed supplies both the progress timer and the upcoming list
+    // for the live response associated with this playback session.
+    const response = await interaction.editReply({
+      content: responseContent,
+      embeds: [buildQueueEmbed(player, 1, defaultQueuePageSize)],
+    });
+    player.setPlayingMessageUpdater(async (terminalState?: PlayingMessageTerminalState) => {
+      const update = terminalState
+        ? {content: terminalState === 'stopped' ? 'Playback stopped.' : 'Playback finished.', embeds: []}
+        : {embeds: [buildQueueEmbed(player, 1, defaultQueuePageSize)]};
+
+      // Public interaction responses become regular channel messages and can
+      // use Message.edit. Ephemeral responses must remain on the interaction webhook.
+      if (queueAddResponseEphemeral) {
+        await interaction.editReply(update);
+      } else {
+        await response.edit(update);
+      }
+
+      if (terminalState && !queueAddResponseEphemeral) {
+        // Controls have no useful action after playback ends. Removing all
+        // reactions also prevents a stale response from looking interactive.
+        await response.reactions.removeAll().catch(error => {
+          console.warn(`Could not remove music controls for guild ${guildId}:`, error);
+        });
+      }
+    }, queueAddResponseEphemeral ? undefined : response.id);
+
+    if (!queueAddResponseEphemeral) {
+      // Add controls sequentially so Discord displays them in transport order.
+      for (const emoji of MUSIC_CONTROL_EMOJIS) {
+        try {
+          // Reaction order is part of the transport-control layout.
+          // eslint-disable-next-line no-await-in-loop
+          await response.react(emoji);
+        } catch (error: unknown) {
+          console.warn(`Could not add music control ${emoji} for guild ${guildId}:`, error);
+        }
+      }
     }
   }
 

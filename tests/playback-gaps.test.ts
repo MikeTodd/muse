@@ -7,6 +7,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 
 const dependencyMocks = vi.hoisted(() => ({
   arrayShuffle: vi.fn((items: unknown[]) => items),
+  buildQueueEmbed: vi.fn(() => ({title: 'queue'})),
   buildPlayingMessageEmbed: vi.fn(() => ({title: 'playing'})),
   createAudioPlayer: vi.fn(),
   createAudioResource: vi.fn(),
@@ -52,6 +53,7 @@ vi.mock('../src/services/file-cache.js', () => ({
 }));
 
 vi.mock('../src/utils/build-embed.js', () => ({
+  buildQueueEmbed: dependencyMocks.buildQueueEmbed,
   buildPlayingMessageEmbed: dependencyMocks.buildPlayingMessageEmbed,
 }));
 

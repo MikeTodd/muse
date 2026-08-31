@@ -85,6 +85,7 @@ vi.mock('../src/services/file-cache.js', () => ({
 }));
 
 vi.mock('../src/utils/build-embed.js', () => ({
+  buildQueueEmbed: vi.fn(() => ({title: 'queue'})),
   buildPlayingMessageEmbed: vi.fn(() => ({title: 'playing'})),
 }));
 

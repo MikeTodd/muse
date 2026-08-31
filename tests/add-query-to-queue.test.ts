@@ -2,14 +2,14 @@ import 'reflect-metadata';
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 
 const dependencyMocks = vi.hoisted(() => ({
-  buildPlayingMessageEmbed: vi.fn(() => ({title: 'playing'})),
+  buildQueueEmbed: vi.fn(() => ({title: 'queue'})),
   getGuildSettings: vi.fn(),
   getMemberVoiceChannel: vi.fn(),
   getMostPopularVoiceChannel: vi.fn(),
 }));
 
 vi.mock('../src/utils/build-embed.js', () => ({
-  buildPlayingMessageEmbed: dependencyMocks.buildPlayingMessageEmbed,
+  buildQueueEmbed: dependencyMocks.buildQueueEmbed,
 }));
 
 vi.mock('../src/utils/get-guild-settings.js', () => ({
@@ -45,13 +45,23 @@ const makeQueuedSong = (title: string, overrides: Partial<SongMetadata> = {}): Q
   requestedBy: 'requester-id',
 });
 
-const makeInteraction = () => ({
-  guild: {id: GUILD_ID},
-  member: {user: {id: 'requester-id'}},
-  channel: {id: 'text-channel-id'},
-  deferReply: vi.fn().mockResolvedValue(undefined),
-  editReply: vi.fn().mockResolvedValue(undefined),
-});
+const makeInteraction = () => {
+  const replyMessage = {
+    edit: vi.fn().mockResolvedValue(undefined),
+    id: 'playing-message-id',
+    react: vi.fn().mockResolvedValue(undefined),
+    reactions: {removeAll: vi.fn().mockResolvedValue(undefined)},
+  };
+
+  return {
+    guild: {id: GUILD_ID},
+    member: {user: {id: 'requester-id'}},
+    channel: {id: 'text-channel-id'},
+    deferReply: vi.fn().mockResolvedValue(undefined),
+    editReply: vi.fn().mockResolvedValue(replyMessage),
+    replyMessage,
+  };
+};
 
 const makePausedPlayer = (...songs: QueuedSong[]) => {
   const player = new Player({} as never, GUILD_ID);
@@ -148,6 +158,7 @@ beforeEach(() => {
   dependencyMocks.getGuildSettings.mockResolvedValue({
     playlistLimit: 50,
     queueAddResponseEphemeral: false,
+    defaultQueuePageSize: 10,
     secondsToWaitAfterQueueEmpties: 0,
   });
   dependencyMocks.getMemberVoiceChannel.mockReturnValue([{id: 'voice-channel-id'}]);
@@ -168,6 +179,7 @@ describe('AddQueryToQueue skip semantics', () => {
       }),
       play: vi.fn().mockResolvedValue(undefined),
       forward: vi.fn().mockResolvedValue(undefined),
+      setPlayingMessageUpdater: vi.fn(),
     };
     const {service} = makeService({player});
     const interaction = makeInteraction();
@@ -178,7 +190,35 @@ describe('AddQueryToQueue skip semantics', () => {
     expect(player.connect).toHaveBeenCalledOnce();
     expect(player.play).toHaveBeenCalledOnce();
     expect(player.forward).not.toHaveBeenCalled();
-    expect(interaction.editReply).toHaveBeenLastCalledWith('u betcha, **New song** added to the queue');
+    expect(interaction.editReply).toHaveBeenLastCalledWith({
+      content: 'u betcha, **New song** added to the queue',
+      embeds: [{title: 'queue'}],
+    });
+    expect(dependencyMocks.buildQueueEmbed).toHaveBeenCalledWith(player, 1, 10);
+    expect(player.setPlayingMessageUpdater).toHaveBeenCalledOnce();
+    expect(player.setPlayingMessageUpdater).toHaveBeenCalledWith(expect.any(Function), 'playing-message-id');
+    expect(interaction.replyMessage.react.mock.calls.map(([emoji]) => emoji)).toEqual([
+      '⏪',
+      '⏯️',
+      '⏩',
+      '⏹️',
+    ]);
+
+    const updatePlayingMessage = player.setPlayingMessageUpdater.mock.calls[0][0] as () => Promise<void>;
+    await updatePlayingMessage();
+
+    expect(interaction.replyMessage.edit).toHaveBeenCalledWith({
+      embeds: [{title: 'queue'}],
+    });
+
+    queue.splice(0);
+    await (updatePlayingMessage as (state: 'finished') => Promise<void>)('finished');
+
+    expect(interaction.replyMessage.edit).toHaveBeenLastCalledWith({
+      content: 'Playback finished.',
+      embeds: [],
+    });
+    expect(interaction.replyMessage.reactions.removeAll).toHaveBeenCalledOnce();
   });
 
   it('skips a pre-existing current track and reports the skip with correct spacing', async () => {

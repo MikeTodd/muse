@@ -34,6 +34,13 @@ Muse is written in TypeScript. You can either run Muse with Docker (recommended)
 
 Muse will log a URL when run. Open this URL in a browser to invite Muse to your server. Muse will DM the server owner after it's added with setup instructions.
 
+The live `/play` response includes reusable rewind, pause/resume, fast-forward,
+and stop reactions. Existing bot roles must allow **View Channel**, **Send
+Messages**, **Embed Links**, **Read Message History**, **Add Reactions**, and
+**Manage Messages**; the final permission lets Muse remove a user's reaction so
+the same control can be pressed again. The startup invite URL includes these
+permissions for new installations.
+
 A 64-bit OS is required to run Muse.
 
 ### Versioning
@@ -107,6 +114,12 @@ npm test
 ```
 
 ## ⚙️ Additional configuration (advanced)
+
+### Live playback response
+
+Set `PLAYING_MESSAGE_UPDATE_INTERVAL_SECONDS` to a positive whole number to
+control how often Muse refreshes the timer, progress rail, and current queue in
+the live `/play` response. It defaults to `5`; restart Muse after changing it.
 
 ### Cache
 

@@ -35,6 +35,7 @@ import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {getYouTubeMediaSource, YtDlpMediaUnavailableError} from '../utils/yt-dlp.js';
 import {Setting} from '@prisma/client';
+import {DEFAULT_PLAYING_MESSAGE_UPDATE_INTERVAL_SECONDS} from '../utils/constants.js';
 
 export {DEFAULT_VOLUME, MediaSource, STATUS};
 export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
@@ -90,6 +91,8 @@ const getFfmpegStartupError = (error: unknown) => {
 };
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
+export type PlayingMessageTerminalState = 'finished' | 'stopped';
+type PlayingMessageUpdater = (terminalState?: PlayingMessageTerminalState) => Promise<void>;
 
 export default class {
   public voiceConnection: VoiceConnection | null = null;
@@ -110,6 +113,13 @@ export default class {
   private readonly playbackAttempts: PlaybackAttemptTracker<QueuedSong, VoiceConnection>;
   private readonly programmaticallyStoppedAudioPlayers = new WeakSet<AudioPlayer>();
   private playPositionInterval: NodeJS.Timeout | undefined;
+  private playingMessageUpdater?: PlayingMessageUpdater;
+  private playingMessageId?: string;
+  private playingMessageTerminalState?: PlayingMessageTerminalState;
+  private playingMessageUpdateInFlight = false;
+  private playingMessageUpdateQueued = false;
+  private secondsSincePlayingMessageUpdate = 0;
+  private readonly playingMessageUpdateIntervalSeconds: number;
 
   private positionInSeconds = 0;
   private readonly fileCache: FileCacheProvider;
@@ -122,10 +132,16 @@ export default class {
   private voiceActivitySessionGeneration = 0;
   private hasRegisteredVoiceActivityListener = false;
 
-  constructor(fileCache: FileCacheProvider, guildId: string, ageRestrictedFallbackResolver?: AgeRestrictedFallbackResolver) {
+  constructor(
+    fileCache: FileCacheProvider,
+    guildId: string,
+    ageRestrictedFallbackResolver?: AgeRestrictedFallbackResolver,
+    playingMessageUpdateIntervalSeconds = DEFAULT_PLAYING_MESSAGE_UPDATE_INTERVAL_SECONDS,
+  ) {
     this.fileCache = fileCache;
     this.guildId = guildId;
     this.ageRestrictedFallbackResolver = ageRestrictedFallbackResolver;
+    this.playingMessageUpdateIntervalSeconds = playingMessageUpdateIntervalSeconds;
     this.playbackAttempts = new PlaybackAttemptTracker(() => ({
       currentSong: this.getCurrent(),
       queueEntryVersion: this.getCurrentQueueEntryId(),
@@ -221,7 +237,11 @@ export default class {
 
   async seek(positionSeconds: number): Promise<void> {
     const attempt = this.playbackAttempts.begin();
-    await this.seekWithAttempt(positionSeconds, attempt);
+    try {
+      await this.seekWithAttempt(positionSeconds, attempt);
+    } finally {
+      this.requestPlayingMessageUpdate();
+    }
   }
 
   async forwardSeek(positionSeconds: number): Promise<void> {
@@ -230,6 +250,27 @@ export default class {
 
   getPosition(): number {
     return this.positionInSeconds;
+  }
+
+  /**
+   * Registers the renderer for the live response created when /play starts a
+   * playback session. A player keeps only the most recent response updater.
+   */
+  setPlayingMessageUpdater(updater: PlayingMessageUpdater, messageId?: string): void {
+    this.playingMessageUpdater = updater;
+    this.playingMessageId = messageId;
+    this.playingMessageTerminalState = undefined;
+    this.secondsSincePlayingMessageUpdate = 0;
+  }
+
+  /** Returns whether a reaction belongs to this player's current response. */
+  isPlayingMessage(messageId: string): boolean {
+    return this.playingMessageId === messageId;
+  }
+
+  /** Requests an immediate render after an externally initiated control. */
+  refreshPlayingMessage(): void {
+    this.requestPlayingMessageUpdate();
   }
 
   async play(allowAgeRestrictedFallback = true): Promise<void> {
@@ -250,6 +291,7 @@ export default class {
     }
 
     this.stopTrackingPosition();
+    this.requestPlayingMessageUpdate();
   }
 
   async forward(skip: number): Promise<void> {
@@ -289,6 +331,8 @@ export default class {
       }
 
       throw error;
+    } finally {
+      this.requestPlayingMessageUpdate();
     }
   }
 
@@ -418,6 +462,8 @@ export default class {
       }
 
       throw error;
+    } finally {
+      this.requestPlayingMessageUpdate();
     }
   }
 
@@ -456,12 +502,15 @@ export default class {
     if (this.getCurrent() !== currentSong) {
       this.currentQueueEntryVersion++;
     }
+
+    this.requestPlayingMessageUpdate();
   }
 
   shuffle(): void {
     const shuffledSongs = shuffle(this.queue.slice(this.queuePosition + 1));
 
     this.queue = [...this.queue.slice(0, this.queuePosition + 1), ...shuffledSongs];
+    this.requestPlayingMessageUpdate();
   }
 
   clear(): void {
@@ -476,15 +525,18 @@ export default class {
 
     this.queuePosition = 0;
     this.queue = newQueue;
+    this.requestPlayingMessageUpdate();
   }
 
   removeFromQueue(index: number, amount = 1): void {
     this.queue.splice(this.queuePosition + index, amount);
+    this.requestPlayingMessageUpdate();
   }
 
   removeCurrent(): void {
     this.queue = [...this.queue.slice(0, this.queuePosition), ...this.queue.slice(this.queuePosition + 1)];
     this.currentQueueEntryVersion++;
+    this.requestPlayingMessageUpdate();
   }
 
   queueSize(): number {
@@ -500,6 +552,9 @@ export default class {
     this.queuePosition = 0;
     this.queue = [];
     this.currentQueueEntryVersion++;
+    // Serialize a terminal edit behind any progress edit already in flight.
+    this.playingMessageTerminalState = 'stopped';
+    this.requestPlayingMessageUpdate();
   }
 
   move(from: number, to: number): QueuedSong {
@@ -508,6 +563,7 @@ export default class {
     }
 
     this.queue.splice(this.queuePosition + to, 0, this.queue.splice(this.queuePosition + from, 1)[0]);
+    this.requestPlayingMessageUpdate();
 
     return this.queue[this.queuePosition + to];
   }
@@ -826,7 +882,62 @@ export default class {
 
     this.playPositionInterval = setInterval(() => {
       this.positionInSeconds++;
+      this.secondsSincePlayingMessageUpdate++;
+      // Reuse the playback clock so paused and idle time never trigger edits.
+      if (this.secondsSincePlayingMessageUpdate >= this.playingMessageUpdateIntervalSeconds) {
+        this.secondsSincePlayingMessageUpdate = 0;
+        this.requestPlayingMessageUpdate();
+      }
     }, 1000);
+  }
+
+  /**
+   * Refreshes the live /play response without allowing Discord edits to
+   * overlap. Any requests received during an edit collapse into one trailing
+   * refresh, which renders the newest player state.
+   */
+  private requestPlayingMessageUpdate(): void {
+    const updater = this.playingMessageUpdater;
+    if (!updater) {
+      return;
+    }
+
+    this.secondsSincePlayingMessageUpdate = 0;
+
+    if (this.playingMessageUpdateInFlight) {
+      this.playingMessageUpdateQueued = true;
+      return;
+    }
+
+    this.playingMessageUpdateInFlight = true;
+    const terminalState = this.playingMessageTerminalState;
+    void updater(terminalState)
+      .then(() => {
+        if (terminalState
+          && this.playingMessageUpdater === updater
+          && this.playingMessageTerminalState === terminalState) {
+          // Terminal responses no longer receive timer edits or controls.
+          this.playingMessageUpdater = undefined;
+          this.playingMessageId = undefined;
+          this.playingMessageTerminalState = undefined;
+        }
+      })
+      .catch(error => {
+        if (this.playingMessageUpdater === updater) {
+          // Deleted or otherwise uneditable messages should not be retried every five seconds.
+          this.playingMessageUpdater = undefined;
+          this.playingMessageId = undefined;
+          this.playingMessageTerminalState = undefined;
+          console.warn(`Could not update playing message for guild ${this.guildId}:`, error);
+        }
+      })
+      .finally(() => {
+        this.playingMessageUpdateInFlight = false;
+        if (this.playingMessageUpdateQueued) {
+          this.playingMessageUpdateQueued = false;
+          this.requestPlayingMessageUpdate();
+        }
+      });
   }
 
   private stopTrackingPosition(): void {
@@ -1005,6 +1116,9 @@ export default class {
     this.stopTrackingPosition();
     this.status = STATUS.IDLE;
     this.stopAudioPlayer(true);
+    // Allow the updater to replace the now-empty queue with a finished state.
+    this.playingMessageTerminalState = 'finished';
+    this.requestPlayingMessageUpdate();
 
     const settings = await getGuildSettings(this.guildId);
 
