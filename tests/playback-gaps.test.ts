@@ -479,8 +479,14 @@ describe('PLAY-13 private cookie-copy preservation', () => {
         fs.readFile(temporaryCookiesPath, 'utf8'),
       ]);
       expect(temporaryCookiesPath).not.toBe(sourcePath);
-      expect(directoryStats.mode & 0o777).toBe(0o700);
-      expect(fileStats.mode & 0o777).toBe(0o600);
+      // Windows implements chmod as a compatibility no-op and does not report
+      // POSIX permission bits. Keep the security assertions on POSIX while
+      // still exercising private-copy creation and cleanup on Windows.
+      if (process.platform !== 'win32') {
+        expect(directoryStats.mode & 0o777).toBe(0o700);
+        expect(fileStats.mode & 0o777).toBe(0o600);
+      }
+
       expect(contents).toBe('private-cookie-bytes');
       return {stdout: VALID_MEDIA_RESPONSE};
     });

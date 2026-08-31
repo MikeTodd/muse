@@ -202,8 +202,10 @@ const makeFfmpegCommand = ({deferProcessResult = false, emptyOutput = false, han
 const makeExecutableLayout = async (includePython = true) => {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'muse-ops-yt-dlp-'));
   const bin = path.join(root, 'bin');
-  const executable = path.join(bin, 'yt-dlp');
-  const python = path.join(bin, 'python');
+  // Mirror the executable names used by real virtual environments on each OS.
+  // The production lookup intentionally searches for python.exe on Windows.
+  const executable = path.join(bin, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+  const python = path.join(bin, process.platform === 'win32' ? 'python.exe' : 'python');
   await fs.mkdir(bin);
   await fs.writeFile(executable, '#!/bin/sh\n', {mode: 0o755});
   if (includePython) {
